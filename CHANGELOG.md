@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `climada.ui`: a browser interface for physical risk assessment and adaptation
+  cost-benefit analysis, launched with `climada-ui` or `python -m climada.ui`.
+  Its analysis, chart, dataset and report layers import no Streamlit and can be
+  reused from scripts and notebooks. Install with `pip install climada[ui]`.
+
+### Dependency Changes
+
+Added, as the optional `ui` extra:
+
+- `plotly` >=5.15
+- `streamlit` >=1.36
+
 ## 6.0.1
 
 Release date: 2025-03-13

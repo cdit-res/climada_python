@@ -32,10 +32,17 @@ DEPS_TEST = [
     "pytest-subtests",
 ]
 
+# Requirements for the graphical user interface
+DEPS_UI = [
+    "plotly>=5.15",
+    "streamlit>=1.36",
+]
+
 # Requirements for development
 DEPS_DEV = (
     DEPS_DOC
     + DEPS_TEST
+    + DEPS_UI
     + [
         "pre-commit",
     ]
@@ -101,6 +108,12 @@ setup(
         "doc": DEPS_DOC,
         "test": DEPS_TEST,
         "dev": DEPS_DEV,
+        "ui": DEPS_UI,
+    },
+    entry_points={
+        "console_scripts": [
+            "climada-ui = climada.ui.cli:main",
+        ],
     },
     packages=find_namespace_packages(include=["climada*"]),
     setup_requires=["setuptools_scm"],
