@@ -25,10 +25,12 @@ tests cover.
 
 import math
 import unittest
+import warnings
 from importlib.util import find_spec
 
 import numpy as np
 import pandas as pd
+from scipy import sparse
 
 PLOTLY = find_spec("plotly") is not None
 
@@ -525,6 +527,111 @@ class TestHeatWorkflow(unittest.TestCase):
         self.assertIn("ynthetic", bundle["note"])
 
 
+class TestHeatLabelling(unittest.TestCase):
+    """The impact unit is not the exposure unit, and must not go stale."""
+
+    def test_heat_impact_unit(self):
+        """A mortality run counts deaths, though its exposures are people."""
+        self.assertEqual(heat.impact_unit("HW", "mortality", "people"), "deaths")
+        self.assertEqual(heat.impact_unit("HW", "days_above", "people"), "person-days")
+
+    def test_non_heat_hazard_ignores_a_stale_metric(self):
+        """Switching to a TC hazard must not keep labelling output 'deaths'."""
+        self.assertIsNone(heat.metric_for("TC", "mortality"))
+        self.assertEqual(heat.impact_unit("TC", "mortality", "USD"), "USD")
+
+    def test_missing_or_unknown_metric_falls_back(self):
+        """No metric, or one that no longer exists, uses the exposure unit."""
+        self.assertIsNone(heat.metric_for("HW", None))
+        self.assertIsNone(heat.metric_for("HW", "removed-metric"))
+        self.assertEqual(heat.impact_unit("HW", None, "people"), "people")
+        self.assertEqual(heat.impact_unit("HW", "removed-metric", "people"), "people")
+
+    def test_report_tables_carry_the_impact_unit(self):
+        """An exported heat table must say deaths, not people."""
+        bundle = heat.demo_bundle(years=3)
+        risk = analysis.compute_risk(
+            bundle["exposures"], bundle["impf_set"], bundle["hazard"]
+        )
+        frames = report.result_frames(
+            risk, None, None, {}, {}, [], impact_unit="deaths"
+        )
+        self.assertIn("Impact (deaths)", frames["Exceedance curve"].columns)
+        units = set(frames["Risk summary"]["Unit"])
+        self.assertIn("deaths", units)
+        self.assertIn("people", units)
+
+
+class TestDaysAboveThreshold(unittest.TestCase):
+    """The hazard-side day count, including the sparse edge cases."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.hazard = heat.demo_heat_hazard(years=3)
+
+    def test_matches_a_dense_count(self):
+        """The sparse count must equal the obvious dense one."""
+        dense = self.hazard.intensity.toarray()
+        for threshold in (30.0, 35.0, 40.0):
+            expected = (dense >= threshold).sum(axis=0)
+            frame = heat.days_above_threshold(self.hazard, threshold)
+            years = 1.0 / heat.annual_frequency(self.hazard)
+            np.testing.assert_allclose(
+                frame["days_per_year"].values * years, expected, rtol=1e-9
+            )
+
+    def test_threshold_at_or_below_zero_counts_unstored_cells(self):
+        """Unstored cells are zero, which clears a non-positive threshold.
+
+        Counting only the stored entries would silently miss them, and
+        comparing the sparse matrix directly would densify it.
+        """
+        dense = self.hazard.intensity.toarray()
+        dense[0, 0] = 0.0
+        hazard = heat.demo_heat_hazard(years=3)
+        hazard.intensity = sparse.csr_matrix(dense)
+        hazard.intensity.eliminate_zeros()
+
+        frame = heat.days_above_threshold(hazard, 0.0)
+        years = 1.0 / heat.annual_frequency(hazard)
+        expected = (dense >= 0.0).sum(axis=0)
+        np.testing.assert_allclose(
+            frame["days_per_year"].values * years, expected, rtol=1e-9
+        )
+
+    def test_does_not_densify(self):
+        """The count must not build an events-by-centroids boolean array."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            heat.days_above_threshold(self.hazard, 35.0)
+
+    def test_one_row_per_centroid(self):
+        """Every grid point appears, including ones that never get hot."""
+        frame = heat.days_above_threshold(self.hazard, 99.0)
+        self.assertEqual(len(frame), self.hazard.centroids.size)
+        np.testing.assert_allclose(frame["days_per_year"].values, 0.0)
+
+
+class TestDemoPopulation(unittest.TestCase):
+    """The generated population exposure."""
+
+    def test_columns_are_meaningful(self):
+        """region_id is a category, not a smuggled count."""
+        hazard = heat.demo_heat_hazard(years=2)
+        exposures = heat.demo_population(hazard)
+        self.assertEqual(set(exposures.gdf["region_id"].unique()), {1, 2})
+        self.assertNotIn("category_id", exposures.gdf.columns)
+
+    def test_grid_matches_the_hazard(self):
+        """Exposures sit on the hazard's own centroids, so nothing is dropped."""
+        hazard = heat.demo_heat_hazard(years=2)
+        exposures = heat.demo_population(hazard)
+        self.assertEqual(len(exposures.gdf), hazard.centroids.size)
+        np.testing.assert_allclose(
+            np.sort(exposures.latitude), np.sort(hazard.centroids.lat)
+        )
+
+
 @unittest.skipUnless(
     datasets.DEMO_SCENARIOS["tc_florida"].available, "demo data not installed"
 )
@@ -761,6 +868,9 @@ if __name__ == "__main__":
         TestHeatCurves,
         TestHeatHazard,
         TestHeatWorkflow,
+        TestHeatLabelling,
+        TestDaysAboveThreshold,
+        TestDemoPopulation,
         TestEndToEnd,
     ):
         TESTS.addTests(unittest.TestLoader().loadTestsFromTestCase(case))

@@ -97,6 +97,7 @@ def result_frames(
     meta: Dict[str, Any],
     labels: Dict[str, str],
     measure_rows: List[Dict[str, Any]],
+    impact_unit: Optional[str] = None,
 ) -> Dict[str, pd.DataFrame]:
     """Every table the session produced, keyed by sheet name.
 
@@ -113,6 +114,10 @@ def result_frames(
         Provenance strings.
     measure_rows : list of dict
         The measure specifications as edited.
+    impact_unit : str, optional
+        Unit the impact is in, when it differs from the exposures' -- a heat
+        mortality run has exposures in people but an impact in deaths.
+        Default: the exposures' unit.
 
     Returns
     -------
@@ -127,11 +132,12 @@ def result_frames(
         )
 
     if risk is not None:
+        unit = impact_unit or risk.unit
         frames["Return periods"] = analysis.exceedance_table(risk)
         frames["Exceedance curve"] = pd.DataFrame(
             {
                 "Return period (years)": risk.freq_curve_return_per,
-                f"Impact ({risk.unit})": risk.freq_curve_impact,
+                f"Impact ({unit})": risk.freq_curve_impact,
             }
         )
         frames["Top events"] = analysis.top_events_table(risk.impact, limit=50)
@@ -140,12 +146,36 @@ def result_frames(
         )
         frames["Risk summary"] = pd.DataFrame(
             [
-                {"Metric": "Total exposed value", "Value": risk.total_value},
-                {"Metric": "Average annual impact", "Value": risk.aai},
-                {"Metric": "Annual loss ratio", "Value": risk.loss_ratio},
-                {"Metric": "100-year loss", "Value": risk.rp_value(100)},
-                {"Metric": "250-year loss", "Value": risk.rp_value(250)},
-                {"Metric": "Largest single event", "Value": risk.max_event_impact},
+                {
+                    "Metric": "Total exposed value",
+                    "Value": risk.total_value,
+                    "Unit": risk.unit,
+                },
+                {
+                    "Metric": "Average annual impact",
+                    "Value": risk.aai,
+                    "Unit": unit,
+                },
+                {
+                    "Metric": "Annual impact / exposed value",
+                    "Value": risk.loss_ratio,
+                    "Unit": f"{unit} per {risk.unit}",
+                },
+                {
+                    "Metric": "100-year impact",
+                    "Value": risk.rp_value(100),
+                    "Unit": unit,
+                },
+                {
+                    "Metric": "250-year impact",
+                    "Value": risk.rp_value(250),
+                    "Unit": unit,
+                },
+                {
+                    "Metric": "Largest single event",
+                    "Value": risk.max_event_impact,
+                    "Unit": unit,
+                },
             ]
         )
 

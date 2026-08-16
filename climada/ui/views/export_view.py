@@ -28,7 +28,7 @@ from typing import Dict
 
 import streamlit as st
 
-from climada.ui import analysis, components, datasets, report, state
+from climada.ui import analysis, components, datasets, heat, report, state
 from climada.ui.formatting import fmt_compact, fmt_percent, fmt_ratio
 
 
@@ -64,15 +64,36 @@ def _narrative(risk, cost_ben) -> None:
     lines = []
 
     if risk is not None:
-        lines.append(
-            f"Against the loaded {risk.haz_type} event set, the exposures carry "
-            f"an average annual impact of **{fmt_compact(risk.aai, risk.unit)}**, "
-            f"or {fmt_percent(risk.loss_ratio, digits=3)} of the "
-            f"{fmt_compact(risk.total_value, risk.unit)} exposed. A one-in-100-year "
-            f"year costs {fmt_compact(risk.rp_value(100), risk.unit)}; the worst "
-            f"single event in the set costs "
-            f"{fmt_compact(risk.max_event_impact, risk.unit)}."
-        )
+        metric = heat.metric_for(risk.haz_type, state.get("heat_metric"))
+        unit = _impact_unit(risk)
+        if metric is not None:
+            line = (
+                f"Against the loaded temperature record, the exposed population "
+                f"of {fmt_compact(risk.total_value, metric.exposure_unit)} carries "
+                f"**{fmt_compact(risk.aai, unit)}** per year"
+            )
+            if metric.per_capita_basis and risk.total_value:
+                rate = risk.aai / risk.total_value * metric.per_capita_basis
+                line += (
+                    f", or {rate:,.1f} per " f"{metric.per_capita_basis:,.0f} people"
+                )
+            line += (
+                f". The worst single day in the record accounts for "
+                f"{fmt_compact(risk.max_event_impact, unit)}."
+            )
+            lines.append(line)
+        else:
+            lines.append(
+                f"Against the loaded {risk.haz_type} event set, the exposures "
+                f"carry an average annual impact of "
+                f"**{fmt_compact(risk.aai, unit)}**, or "
+                f"{fmt_percent(risk.loss_ratio, digits=3)} of the "
+                f"{fmt_compact(risk.total_value, risk.unit)} exposed. A "
+                f"one-in-100-year year costs "
+                f"{fmt_compact(risk.rp_value(100), unit)}; the worst single "
+                f"event in the set costs "
+                f"{fmt_compact(risk.max_event_impact, unit)}."
+            )
 
     if cost_ben is not None:
         summary = analysis.cost_benefit_summary(cost_ben)
@@ -114,6 +135,11 @@ def _assumptions() -> None:
     )
 
 
+def _impact_unit(risk) -> str:
+    """The unit the impact numbers are in, which is not the exposure unit."""
+    return heat.impact_unit(risk.haz_type, state.get("heat_metric"), risk.unit)
+
+
 def _labels() -> Dict[str, str]:
     """Provenance strings for the current inputs."""
     rows = state.measure_rows()
@@ -139,6 +165,7 @@ def _downloads(risk, cost_ben) -> None:
         state.get("cost_benefit_meta") or {},
         _labels(),
         state.measure_rows(),
+        impact_unit=_impact_unit(risk) if risk is not None else None,
     )
 
     try:

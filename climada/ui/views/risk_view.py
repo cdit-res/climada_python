@@ -151,9 +151,6 @@ def _headline(risk: analysis.RiskResult) -> None:
 def _impact_unit(risk: analysis.RiskResult) -> str:
     """The unit the impact numbers are in, which is not the exposure unit.
 
-    A heat mortality run has exposures in people but an impact in deaths;
-    labelling the axis "people" would misreport it.
-
     Parameters
     ----------
     risk : RiskResult
@@ -162,16 +159,12 @@ def _impact_unit(risk: analysis.RiskResult) -> str:
     -------
     str
     """
-    metric = _heat_metric(risk)
-    return metric.unit if metric is not None else risk.unit
+    return heat.impact_unit(risk.haz_type, state.get("heat_metric"), risk.unit)
 
 
 def _heat_metric(risk: analysis.RiskResult):
     """The heat metric in play, or None when this is not a heat analysis."""
-    key = state.get("heat_metric")
-    if key is None or risk.haz_type != heat.HAZ_TYPE:
-        return None
-    return heat.METRICS.get(key)
+    return heat.metric_for(risk.haz_type, state.get("heat_metric"))
 
 
 def _heat_headline(risk: analysis.RiskResult, metric) -> None:

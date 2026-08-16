@@ -212,6 +212,9 @@ def adopt_entity(entity, label: str, keep_measures: bool = True) -> None:
     put("impf_set", entity.impact_funcs)
     put("impf_label", label)
     put("impf_note", "")
+    # An entity's curves are not a heat metric; a metric left over from an
+    # earlier run would relabel this one's results.
+    put("heat_metric", None)
     put("present_year", int(entity.exposures.ref_year))
 
     rates = entity.disc_rates

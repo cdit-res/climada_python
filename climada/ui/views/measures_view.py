@@ -353,10 +353,7 @@ def _preview() -> None:
 
         # A heat run has exposures in people but an impact in deaths, so the
         # exposure unit is the wrong label for these numbers.
-        metric_key = state.get("heat_metric")
-        unit = baseline.unit
-        if metric_key and haz_type == heat.HAZ_TYPE:
-            unit = heat.METRICS[metric_key].unit
+        unit = heat.impact_unit(haz_type, state.get("heat_metric"), baseline.unit)
 
         components.stat_row(
             [

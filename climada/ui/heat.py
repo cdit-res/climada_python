@@ -69,6 +69,8 @@ __all__ = [
     "demo_population",
     "hazard_from_dataset",
     "hazard_temperature_summary",
+    "impact_unit",
+    "metric_for",
     "labour_loss_impf_set",
     "mortality_impf_set",
     "set_annual_frequency",
@@ -175,6 +177,51 @@ METRICS: Dict[str, HeatMetric] = {
     ),
 }
 """The heat metrics the interface can compute, keyed by identifier."""
+
+
+def metric_for(haz_type: str, key: Optional[str]) -> Optional[HeatMetric]:
+    """The heat metric in play, or ``None`` when this is not a heat analysis.
+
+    Guards the two ways a label can go stale: a metric recorded against a
+    hazard that is no longer heat, and a key that no longer names a metric.
+
+    Parameters
+    ----------
+    haz_type : str
+        Hazard type of the analysis.
+    key : str or None
+        Metric key recorded when the vulnerability curve was built.
+
+    Returns
+    -------
+    HeatMetric or None
+    """
+    if not key or haz_type != HAZ_TYPE:
+        return None
+    return METRICS.get(key)
+
+
+def impact_unit(haz_type: str, key: Optional[str], fallback: str) -> str:
+    """The unit the impact numbers are in, which is not the exposure unit.
+
+    A heat mortality run has exposures in people but an impact in deaths;
+    labelling the result "people" would misreport it.
+
+    Parameters
+    ----------
+    haz_type : str
+        Hazard type of the analysis.
+    key : str or None
+        Metric key recorded when the vulnerability curve was built.
+    fallback : str
+        Unit to use when this is not a heat analysis, normally the exposures'.
+
+    Returns
+    -------
+    str
+    """
+    metric = metric_for(haz_type, key)
+    return metric.unit if metric is not None else fallback
 
 
 # --------------------------------------------------------------------------- #
@@ -692,8 +739,20 @@ def days_above_threshold(hazard: Hazard, threshold: float) -> pd.DataFrame:
     pandas.DataFrame
         Columns ``latitude``, ``longitude`` and ``days_per_year``.
     """
-    exceed = (hazard.intensity >= threshold).sum(axis=0)
-    counts = np.asarray(exceed).ravel().astype(float)
+    # Count on the stored entries only. Comparing a sparse matrix against a
+    # scalar densifies it, which on a real reanalysis grid (thousands of days
+    # by tens of thousands of points) is gigabytes for a column count.
+    matrix = hazard.intensity.tocoo()
+    n_centroids = hazard.centroids.size
+    hot = matrix.data >= threshold
+    counts = np.bincount(matrix.col[hot], minlength=n_centroids).astype(float)
+
+    if threshold <= 0:
+        # Cells with no stored value are zero, which clears a threshold at or
+        # below zero. Counting only stored entries would miss them.
+        stored = np.bincount(matrix.col, minlength=n_centroids)
+        counts += hazard.size - stored
+
     frequency = annual_frequency(hazard)
     years = 1.0 / frequency if np.isfinite(frequency) and frequency > 0 else np.nan
 
@@ -864,7 +923,6 @@ def demo_heat_hazard(
 def demo_population(
     hazard: Hazard,
     total_population: float = 1_600_000.0,
-    over_65_share: float = 0.21,
     ref_year: int = 2024,
 ) -> Exposures:
     """A synthetic population grid matching a demo heat hazard's centroids.
@@ -880,9 +938,6 @@ def demo_population(
         Supplies the grid. Usually the output of :py:func:`demo_heat_hazard`.
     total_population : float, optional
         People to distribute over the grid. Default: 1.6 million.
-    over_65_share : float, optional
-        Share of the population recorded in a ``category_id`` column as the
-        heat-vulnerable age group. Default: 0.21.
     ref_year : int, optional
         Reference year of the population figures. Default: 2024.
 
@@ -908,8 +963,8 @@ def demo_population(
                 "latitude": lat,
                 "longitude": lon,
                 "value": people,
+                # 1 is the dense, hot centre; 2 the cooler periphery.
                 "region_id": np.where(radius < 0.5, 1, 2),
-                "category_id": np.round(people * over_65_share).astype(int),
             }
         ),
         value_unit="people",

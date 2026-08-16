@@ -691,6 +691,12 @@ def _impf_section() -> None:
                 state.put("impf_set", loaded, invalidates=True)
                 state.put("impf_label", f"CLIMADA default for {haz_type}")
                 state.put("impf_note", note)
+                # The HW default is the mortality curve; anything else is not
+                # a heat metric and must not be labelled as one.
+                state.put(
+                    "heat_metric",
+                    "mortality" if haz_type == heat.HAZ_TYPE else None,
+                )
                 st.rerun()
 
     with emanuel_tab:
@@ -744,6 +750,7 @@ def _impf_section() -> None:
                     f"Emanuel 2011 (v_thresh={v_thresh}, v_half={v_half})",
                 )
                 state.put("impf_note", "")
+                state.put("heat_metric", None)
                 st.rerun()
 
     with step_tab:
@@ -783,6 +790,7 @@ def _impf_section() -> None:
                 state.put("impf_set", loaded, invalidates=True)
                 state.put("impf_label", f"Step function above {threshold}")
                 state.put("impf_note", "")
+                state.put("heat_metric", None)
                 st.rerun()
 
     with file_tab:
@@ -799,6 +807,7 @@ def _impf_section() -> None:
                 state.put("impf_set", loaded, invalidates=True)
                 state.put("impf_label", uploaded.name)
                 state.put("impf_note", "")
+                state.put("heat_metric", None)
                 st.rerun()
 
     if impf_set is not None and haz_type:
@@ -1014,12 +1023,41 @@ def _readiness_section() -> None:
         else:
             st.markdown(f"- **{name.capitalize()}**: nothing loaded")
 
-    problems = _compatibility_problems()
+    problems = _compatibility_problems() + _metric_problems()
     if problems:
         for problem in problems:
             st.warning(problem)
     elif state.inputs_ready():
         st.success("Ready to run. Open **Risk** for the physical risk assessment.")
+
+
+def _metric_problems() -> List[str]:
+    """Catch a heat metric being counted over the wrong kind of exposure."""
+    metric = heat.metric_for(state.haz_type(), state.get("heat_metric"))
+    exposures = state.get("exposures")
+    if metric is None or exposures is None:
+        return []
+
+    unit = (exposures.value_unit or "").strip().lower()
+    expected = metric.exposure_unit.lower()
+    if unit == expected:
+        return []
+
+    # 'workers' is a subset of people, so people-valued exposures are a
+    # defensible stand-in for a labour metric as long as the reader knows.
+    if expected == "workers" and unit == "people":
+        return [
+            f"'{metric.label}' counts lost work-days over the *working* "
+            "population, but the exposures are total population. The result "
+            "will overstate lost labour by the inverse of the participation "
+            "rate -- scale the exposures, or read it as an upper bound."
+        ]
+
+    return [
+        f"'{metric.label}' expects exposures in {metric.exposure_unit}, but "
+        f"these are in '{exposures.value_unit}'. The impact would be "
+        f"{metric.unit} computed over the wrong quantity."
+    ]
 
 
 def _compatibility_problems() -> List[str]:
