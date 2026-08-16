@@ -34,6 +34,7 @@ import pandas as pd
 from climada.entity import Entity, Exposures, ImpactFunc, ImpactFuncSet
 from climada.entity.impact_funcs.trop_cyclone import ImpfSetTropCyclone, ImpfTropCyclone
 from climada.hazard import Hazard
+from climada.ui import heat
 from climada.util.api_client import EXP_TYPES, HAZ_TYPES, Client
 from climada.util.constants import (
     ENT_DEMO_FUTURE,
@@ -62,7 +63,7 @@ __all__ = [
     "step_impf_set",
 ]
 
-HAZARD_SUFFIXES = (".h5", ".hdf5", ".xls", ".xlsx")
+HAZARD_SUFFIXES = (".h5", ".hdf5", ".xls", ".xlsx", ".nc", ".nc4", ".grib")
 EXPOSURES_SUFFIXES = (".h5", ".hdf5", ".xls", ".xlsx", ".csv", ".mat")
 
 
@@ -132,6 +133,50 @@ DEMO_SCENARIOS: Dict[str, DemoScenario] = {
     ),
 }
 """Demo analyses selectable in the interface, keyed by identifier."""
+
+
+GENERATED_SCENARIOS: Dict[str, Dict[str, Any]] = {
+    "heat_city": {
+        "label": "Urban heat, synthetic city",
+        "description": (
+            "A generated 20-season daily temperature field over a 25 km city "
+            "grid, with an urban heat island, a warming trend and a population "
+            "concentrated where it is hottest. Synthetic -- for learning the "
+            "heat workflow, not for conclusions about a real place."
+        ),
+        "builder": heat.demo_bundle,
+    },
+}
+"""Analyses the interface generates rather than reads from disk.
+
+CLIMADA ships no heat data, and neither the Data API nor Petals serves a heat
+hazard, so the heat workflow would otherwise have nothing to demonstrate on.
+"""
+
+
+def load_generated(key: str) -> Dict[str, Any]:
+    """Build a generated demo scenario.
+
+    Parameters
+    ----------
+    key : str
+        Key into :py:data:`GENERATED_SCENARIOS`.
+
+    Returns
+    -------
+    dict
+        ``hazard``, ``exposures``, ``impf_set``, ``metric``, ``note`` and
+        ``label``.
+
+    Raises
+    ------
+    KeyError
+        If ``key`` is not a known generated scenario.
+    """
+    scenario = GENERATED_SCENARIOS[key]
+    bundle = scenario["builder"]()
+    bundle["label"] = scenario["label"]
+    return bundle
 
 
 def load_demo(key: str) -> Dict[str, Any]:
@@ -209,6 +254,12 @@ def load_hazard_file(path: Path, haz_type: Optional[str] = None) -> Hazard:
         hazard = Hazard.from_hdf5(path)
     elif suffix in (".xls", ".xlsx"):
         hazard = Hazard.from_excel(path, haz_type=haz_type)
+    elif suffix in (".nc", ".nc4", ".grib"):
+        raise ValueError(
+            f"'{path.name}' is gridded data. Read it with "
+            "climada.ui.datasets.load_gridded_hazard, which needs to know "
+            "which variable holds the intensity."
+        )
     else:
         raise ValueError(
             f"Cannot read '{path.name}' as a hazard. Supported: "
@@ -218,6 +269,143 @@ def load_hazard_file(path: Path, haz_type: Optional[str] = None) -> Hazard:
         hazard.haz_type = haz_type
     hazard.check()
     return hazard
+
+
+def load_gridded_hazard(
+    path: Path,
+    intensity: str,
+    haz_type: str = heat.HAZ_TYPE,
+    intensity_unit: str = "degC",
+    time_var: str = "time",
+    lat_var: str = "latitude",
+    lon_var: str = "longitude",
+    to_celsius: bool = False,
+    years: Optional[float] = None,
+) -> Hazard:
+    """Read a gridded NetCDF/GRIB field into a hazard, one event per time step.
+
+    This is the route for heat: daily maximum temperature from a reanalysis or
+    a climate model. Event frequencies are set from the length of the record,
+    so the average annual impact comes out per year rather than per record.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        NetCDF or GRIB file.
+    intensity : str
+        Name of the variable holding the intensity, e.g. ``'tasmax'``.
+    haz_type : str, optional
+        CLIMADA hazard type. Default: ``'HW'``.
+    intensity_unit : str, optional
+        Unit after any conversion. Default: ``'degC'``.
+    time_var, lat_var, lon_var : str, optional
+        Names of the coordinates in the file.
+    to_celsius : bool, optional
+        Subtract 273.15, for data in kelvin. Default: False.
+    years : float, optional
+        Record length in years. Default: derive it from the timestamps.
+
+    Returns
+    -------
+    climada.hazard.Hazard
+    """
+    import xarray as xr
+
+    with xr.open_dataset(path, chunks="auto") as dataset:
+        if intensity not in dataset.variables:
+            raise ValueError(
+                f"'{intensity}' is not in the file. Available variables: "
+                f"{', '.join(sorted(map(str, dataset.data_vars)))}."
+            )
+        hazard = heat.hazard_from_dataset(
+            dataset,
+            intensity=intensity,
+            intensity_unit=intensity_unit,
+            coordinate_vars={
+                "event": time_var,
+                "latitude": lat_var,
+                "longitude": lon_var,
+            },
+            to_celsius=to_celsius,
+            years=years,
+        )
+    hazard.haz_type = haz_type
+    return hazard
+
+
+def api_population(client: Client, country: str) -> Exposures:
+    """Gridded population for one country, from the Data API's LitPop layer.
+
+    The exposure layer heat metrics need: people, not dollars.
+
+    Parameters
+    ----------
+    client : climada.util.api_client.Client
+    country : str
+        Country name as the API spells it.
+
+    Returns
+    -------
+    climada.entity.Exposures
+        Values in people.
+
+    Notes
+    -----
+    Falls back to reading the downloaded HDF5 table directly when CLIMADA's
+    own reader trips over the file's metadata attribute, which some published
+    LitPop files store in a format newer pandas will not unpickle. The table
+    itself reads fine, and the metadata it would have supplied is known: these
+    layers are WGS 84, in people.
+    """
+    properties = {
+        "country_name": country,
+        "fin_mode": "pop",
+        "exponents": "(0,1)",
+    }
+    try:
+        return client.get_exposures("litpop", properties=properties)
+    except AttributeError:
+        LOGGER.info("Falling back to a direct table read for %s.", country)
+        return _exposures_from_api_files(client, "litpop", properties)
+
+
+def _exposures_from_api_files(
+    client: Client, exposures_type: str, properties: Dict[str, str]
+) -> Exposures:
+    """Read an API exposures dataset without relying on its HDF5 metadata.
+
+    Parameters
+    ----------
+    client : climada.util.api_client.Client
+    exposures_type : str
+        Data type to query, e.g. ``'litpop'``.
+    properties : dict
+        Property filters identifying the dataset.
+
+    Returns
+    -------
+    climada.entity.Exposures
+    """
+    dataset = client.get_dataset_info(data_type=exposures_type, properties=properties)
+    _, files = client.download_dataset(dataset)
+
+    frames = []
+    for local in files:
+        with pd.HDFStore(local, mode="r") as store:
+            frames.append(store["exposures"])
+
+    frame = pd.concat(frames, ignore_index=True).drop(
+        columns=["geometry"], errors="ignore"
+    )
+    ref_year = dataset.properties.get("reference_year")
+    exposures = Exposures(
+        frame,
+        value_unit="people",
+        ref_year=int(ref_year) if ref_year else None,
+        crs="EPSG:4326",
+    )
+    exposures.check()
+    return exposures
 
 
 def load_exposures_file(path: Path) -> Exposures:
@@ -395,6 +583,16 @@ def default_impf_set(haz_type: str) -> Tuple[ImpactFuncSet, str]:
             "Emanuel (2011) tropical cyclone curves, regionally calibrated "
             "(Eberenz et al. 2021). Impact function ids follow CLIMADA's region "
             "codes; assign the matching id to your exposures.",
+        )
+
+    if haz_type == heat.HAZ_TYPE:
+        return (
+            heat.mortality_impf_set(),
+            "Heat-attributable mortality, from a minimum-mortality temperature "
+            "and a relative risk rising with heat. Neither CLIMADA core nor "
+            "Petals ships a calibrated heat curve, so this is a screening "
+            "relationship: set the MMT and the risk per degree from local "
+            "epidemiology on the Vulnerability tab before reporting deaths.",
         )
 
     impf_set = ImpactFuncSet(

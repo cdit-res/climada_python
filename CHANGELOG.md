@@ -8,6 +8,13 @@
   cost-benefit analysis, launched with `climada-ui` or `python -m climada.ui`.
   Its analysis, chart, dataset and report layers import no Streamlit and can be
   reused from scripts and notebooks. Install with `pip install climada[ui]`.
+- `climada.ui.heat`: heat risk support, which neither the core, the Data API
+  nor Petals provides. Reads gridded temperature into an `HW` hazard with the
+  per-year event frequency that daily records imply, and supplies four
+  temperature-response functions (heat-attributable mortality, person-days
+  above a threshold, person-degree-days, lost labour), population exposure via
+  LitPop's `pop` layer, heat adaptation presets, and a generated synthetic
+  city for demonstrating the workflow.
 
 ### Dependency Changes
 

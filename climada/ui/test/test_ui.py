@@ -32,7 +32,7 @@ import pandas as pd
 
 PLOTLY = find_spec("plotly") is not None
 
-from climada.ui import analysis, datasets, formatting, report
+from climada.ui import analysis, datasets, formatting, heat, report
 from climada.ui.formatting import norm_values, safe_ratio
 
 if PLOTLY:
@@ -298,6 +298,233 @@ class TestReport(unittest.TestCase):
         self.assertNotIn("Hazard intensity factor", settings)
 
 
+class TestHeatCurves(unittest.TestCase):
+    """Temperature-response functions."""
+
+    def test_mortality_zero_below_mmt(self):
+        """No excess deaths are attributed at or below the MMT."""
+        impf = heat.mortality_impf_set(mmt=25.0).get_func(heat.HAZ_TYPE, 1)
+        below = impf.intensity <= 25.0
+        np.testing.assert_allclose(impf.paa[below], 0.0)
+
+    def test_mortality_rises_with_heat(self):
+        """Above the MMT the rate increases monotonically."""
+        impf = heat.mortality_impf_set(mmt=25.0).get_func(heat.HAZ_TYPE, 1)
+        self.assertTrue(np.all(np.diff(impf.paa) >= -1e-15))
+        self.assertGreater(impf.paa[-1], 0)
+
+    def test_mortality_matches_the_stated_formula(self):
+        """The curve is baseline * rr * degrees above the MMT."""
+        impf = heat.mortality_impf_set(
+            mmt=20.0, rr_per_degree=0.05, baseline_daily_mortality=2e-5
+        ).get_func(heat.HAZ_TYPE, 1)
+        at_30 = float(np.interp(30.0, impf.intensity, impf.paa))
+        self.assertAlmostEqual(at_30, 2e-5 * 0.05 * 10.0, places=12)
+
+    def test_mortality_rejects_bad_parameters(self):
+        """A curve that cannot mean anything must not be built."""
+        with self.assertRaises(ValueError):
+            heat.mortality_impf_set(mmt=40.0, max_temperature=35.0)
+        with self.assertRaises(ValueError):
+            heat.mortality_impf_set(rr_per_degree=-0.1)
+
+    def test_days_above_is_a_clean_step(self):
+        """Below the threshold nothing counts; at or above, everyone does."""
+        impf = heat.days_above_impf_set(threshold=35.0).get_func(heat.HAZ_TYPE, 1)
+        self.assertAlmostEqual(float(np.interp(34.0, impf.intensity, impf.paa)), 0.0)
+        self.assertAlmostEqual(float(np.interp(40.0, impf.intensity, impf.paa)), 1.0)
+
+    def test_degree_days_are_linear_above_the_base(self):
+        """Five degrees over the base counts five times as much as one."""
+        impf = heat.degree_days_impf_set(threshold=30.0).get_func(heat.HAZ_TYPE, 1)
+        self.assertAlmostEqual(float(np.interp(35.0, impf.intensity, impf.paa)), 5.0)
+        self.assertAlmostEqual(float(np.interp(29.0, impf.intensity, impf.paa)), 0.0)
+
+    def test_labour_loss_saturates(self):
+        """Work stops entirely at and above the upper bound."""
+        impf = heat.labour_loss_impf_set(work_start=26.0, work_stop=38.0)
+        curve = impf.get_func(heat.HAZ_TYPE, 1)
+        self.assertAlmostEqual(float(np.interp(32.0, curve.intensity, curve.paa)), 0.5)
+        self.assertAlmostEqual(float(np.interp(45.0, curve.intensity, curve.paa)), 1.0)
+        with self.assertRaises(ValueError):
+            heat.labour_loss_impf_set(work_start=38.0, work_stop=26.0)
+
+    def test_every_metric_builds(self):
+        """The metric registry and the builders stay in step."""
+        for key in heat.METRICS:
+            impf_set = heat.impf_set_for_metric(key)
+            self.assertTrue(impf_set.get_func(heat.HAZ_TYPE))
+        with self.assertRaises(KeyError):
+            heat.impf_set_for_metric("not-a-metric")
+
+    def test_response_sits_in_paa(self):
+        """The module's stated convention: response in paa, mdd held at 1."""
+        curve = heat.mortality_impf_set().get_func(heat.HAZ_TYPE, 1)
+        np.testing.assert_allclose(curve.mdd, 1.0)
+
+
+class TestHeatHazard(unittest.TestCase):
+    """Frequency handling and the generated demo."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.hazard = heat.demo_heat_hazard(years=4)
+
+    def test_demo_is_a_heat_hazard(self):
+        """Type, unit and grid are as advertised."""
+        self.assertEqual(self.hazard.haz_type, heat.HAZ_TYPE)
+        self.assertEqual(self.hazard.units, "degC")
+        self.assertEqual(self.hazard.size, 4 * 122)
+        self.assertEqual(self.hazard.centroids.size, 144)
+
+    def test_demo_is_reproducible(self):
+        """The same seed gives the same field, so a demo run is repeatable."""
+        again = heat.demo_heat_hazard(years=4)
+        np.testing.assert_allclose(
+            self.hazard.intensity.toarray(), again.intensity.toarray()
+        )
+
+    def test_frequency_is_per_year(self):
+        """Daily events over n years each carry 1/n per year.
+
+        This is the trap heat data sets for CLIMADA: leaving the frequency at
+        1.0 per event inflates the annual impact by the record length.
+        """
+        np.testing.assert_allclose(self.hazard.frequency, 1.0 / 4, rtol=0.02)
+        self.assertEqual(self.hazard.frequency_unit, "1/year")
+
+    def test_set_annual_frequency_from_dates(self):
+        """The record length is recoverable from the event dates alone."""
+        hazard = heat.demo_heat_hazard(years=4)
+        hazard.frequency = np.ones(hazard.size)
+        rebuilt = heat.set_annual_frequency(hazard)
+        self.assertAlmostEqual(float(rebuilt.frequency[0]), 1.0 / 4, places=2)
+
+    def test_set_annual_frequency_copies_by_default(self):
+        """Reweighting must not mutate the caller's hazard."""
+        hazard = heat.demo_heat_hazard(years=4)
+        hazard.frequency = np.ones(hazard.size)
+        heat.set_annual_frequency(hazard, years=10)
+        np.testing.assert_allclose(hazard.frequency, 1.0)
+
+    def test_set_annual_frequency_rejects_nonsense(self):
+        """A record cannot span zero or negative years."""
+        with self.assertRaises(ValueError):
+            heat.set_annual_frequency(self.hazard, years=0)
+
+    def test_temperature_summary(self):
+        """The summary reports a sane record length and peak."""
+        summary = heat.hazard_temperature_summary(self.hazard)
+        self.assertAlmostEqual(summary["years"], 4, delta=0.5)
+        self.assertGreater(summary["peak"], 30.0)
+        self.assertEqual(summary["centroids"], 144)
+
+    def test_days_above_threshold(self):
+        """The hazard-side diagnostic returns per-year counts per point."""
+        frame = heat.days_above_threshold(self.hazard, 35.0)
+        self.assertEqual(len(frame), 144)
+        self.assertTrue((frame["days_per_year"] >= 0).all())
+        self.assertTrue((frame["days_per_year"] <= 366).all())
+
+
+class TestHeatWorkflow(unittest.TestCase):
+    """The heat analysis end to end."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bundle = heat.demo_bundle(years=6)
+        cls.hazard = cls.bundle["hazard"]
+        cls.exposures = cls.bundle["exposures"]
+
+    def test_population_exposure(self):
+        """The demo population is in people and points at the heat curve."""
+        self.assertEqual(self.exposures.value_unit, "people")
+        self.assertIn(f"impf_{heat.HAZ_TYPE}", self.exposures.gdf.columns)
+        self.assertAlmostEqual(
+            float(self.exposures.value.sum()), 1_600_000.0, delta=1.0
+        )
+
+    def test_mortality_is_plausible(self):
+        """Annual deaths land in a believable per-100,000 band."""
+        risk = analysis.compute_risk(
+            self.exposures, self.bundle["impf_set"], self.hazard
+        )
+        per_100k = risk.aai / float(self.exposures.value.sum()) * 1e5
+        self.assertGreater(per_100k, 1.0)
+        self.assertLess(per_100k, 500.0)
+
+    def test_every_metric_runs(self):
+        """All four metrics produce a positive annual impact."""
+        for key in heat.METRICS:
+            impf_set = heat.impf_set_for_metric(key)
+            risk = analysis.compute_risk(self.exposures, impf_set, self.hazard)
+            self.assertGreater(risk.aai, 0, msg=key)
+
+    def test_person_days_cannot_exceed_the_population(self):
+        """On any single day, at most everyone is exposed."""
+        impf_set = heat.days_above_impf_set(threshold=20.0)
+        risk = analysis.compute_risk(self.exposures, impf_set, self.hazard)
+        self.assertLessEqual(
+            risk.max_event_impact, float(self.exposures.value.sum()) * 1.001
+        )
+
+    def test_heat_measures_reduce_risk(self):
+        """Every heat preset must lower the annual death count."""
+        impf_set = self.bundle["impf_set"]
+        base = analysis.compute_risk(self.exposures, impf_set, self.hazard).aai
+        for name, preset in heat.HEAT_MEASURE_PRESETS.items():
+            row = analysis.default_measure_row(name)
+            row.update(preset["fields"])
+            measure = analysis.build_measure(row, heat.HAZ_TYPE)
+            new_exp, new_impf, new_haz = measure.apply(
+                self.exposures, impf_set, self.hazard
+            )
+            treated = analysis.compute_risk(new_exp, new_impf, new_haz).aai
+            self.assertLess(treated, base, msg=name)
+
+    def test_cost_benefit_on_heat(self):
+        """A costed heat measure appraises like any other."""
+        row = analysis.default_measure_row("Warning system")
+        row.update(heat.HEAT_MEASURE_PRESETS["Heat-health warning system"]["fields"])
+        row["cost"] = 5.0e6
+        measure_set = analysis.build_measure_set([row], heat.HAZ_TYPE)
+        disc = analysis.build_disc_rates(0.02, 2024, 2040)
+        entity = analysis.build_entity(
+            self.exposures, self.bundle["impf_set"], measure_set, disc, ref_year=2024
+        )
+        ent_future = analysis.build_entity(
+            analysis.grow_exposures(self.exposures, 1.1, ref_year=2040),
+            self.bundle["impf_set"],
+            measure_set,
+            disc,
+            ref_year=2040,
+        )
+        cost_ben = analysis.run_cost_benefit(
+            self.hazard,
+            entity,
+            ent_future=ent_future,
+            future_year=2040,
+            imp_time_depen=1.0,
+        )
+        table = analysis.cost_benefit_table(cost_ben)
+        self.assertEqual(len(table), 1)
+        self.assertGreater(table.iloc[0][f"Benefit ({cost_ben.unit})"], 0)
+
+    def test_default_impf_for_heat(self):
+        """Asking for the HW default gets a heat curve and an honest caveat."""
+        impf_set, note = datasets.default_impf_set(heat.HAZ_TYPE)
+        self.assertTrue(impf_set.get_func(heat.HAZ_TYPE))
+        self.assertIn("screening", note.lower())
+
+    def test_generated_scenario_registered(self):
+        """The interface's generated-scenario registry builds a usable bundle."""
+        bundle = datasets.load_generated("heat_city")
+        for key in ("hazard", "exposures", "impf_set", "note", "label"):
+            self.assertIn(key, bundle)
+        self.assertEqual(bundle["hazard"].haz_type, heat.HAZ_TYPE)
+        self.assertIn("ynthetic", bundle["note"])
+
+
 @unittest.skipUnless(
     datasets.DEMO_SCENARIOS["tc_florida"].available, "demo data not installed"
 )
@@ -531,6 +758,9 @@ if __name__ == "__main__":
         TestExposureTable,
         TestImpactFunctions,
         TestReport,
+        TestHeatCurves,
+        TestHeatHazard,
+        TestHeatWorkflow,
         TestEndToEnd,
     ):
         TESTS.addTests(unittest.TestLoader().loadTestsFromTestCase(case))

@@ -565,9 +565,7 @@ def _bcr_label(value: float) -> str:
     if not np.isfinite(value):
         # An unbounded ratio means no cost was entered, not a perfect measure.
         return "  no cost entered" if value > 0 else "  not computed"
-    return f"{value:,.2f}" + (
-        "  pays for itself" if value >= 1 else "  below cost"
-    )
+    return f"{value:,.2f}" + ("  pays for itself" if value >= 1 else "  below cost")
 
 
 def _bcr_color(value: float) -> str:

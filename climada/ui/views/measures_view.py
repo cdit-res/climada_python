@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from climada.ui import analysis, charts, components, datasets, state
+from climada.ui import analysis, charts, components, datasets, heat, state
 from climada.ui.formatting import fmt_compact, fmt_percent
 
 PRESETS: Dict[str, Dict[str, Any]] = {
@@ -242,10 +242,20 @@ def _validate(rows: List[Dict[str, Any]]) -> List[str]:
 
 
 def _presets() -> None:
-    """One-click starting points for common measure types."""
+    """One-click starting points, matched to the loaded hazard."""
     st.subheader("Add a preset")
-    columns = st.columns(len(PRESETS))
-    for column, (label, preset) in zip(columns, PRESETS.items()):
+    presets = (
+        heat.HEAT_MEASURE_PRESETS if state.haz_type() == heat.HAZ_TYPE else PRESETS
+    )
+    if presets is heat.HEAT_MEASURE_PRESETS:
+        st.caption(
+            "Heat adaptation options. The reductions are indicative and vary "
+            "widely by city, housing stock and population age -- replace them "
+            "with local evidence."
+        )
+
+    columns = st.columns(len(presets))
+    for column, (label, preset) in zip(columns, presets.items()):
         with column:
             st.markdown(f"**{label}**")
             st.caption(preset["note"])
@@ -340,15 +350,19 @@ def _preview() -> None:
 
         averted = baseline.aai - treated.aai
         share = averted / baseline.aai if baseline.aai else float("nan")
+
+        # A heat run has exposures in people but an impact in deaths, so the
+        # exposure unit is the wrong label for these numbers.
+        metric_key = state.get("heat_metric")
+        unit = baseline.unit
+        if metric_key and haz_type == heat.HAZ_TYPE:
+            unit = heat.METRICS[metric_key].unit
+
         components.stat_row(
             [
-                (
-                    "Annual risk without",
-                    fmt_compact(baseline.aai, baseline.unit),
-                    None,
-                ),
-                ("Annual risk with", fmt_compact(treated.aai, treated.unit), None),
-                ("Annual risk averted", fmt_compact(averted, treated.unit), None),
+                ("Annual risk without", fmt_compact(baseline.aai, unit), None),
+                ("Annual risk with", fmt_compact(treated.aai, unit), None),
+                ("Annual risk averted", fmt_compact(averted, unit), None),
                 ("Share averted", fmt_percent(share), None),
             ]
         )

@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from climada.ui import analysis, charts, components, state
+from climada.ui import analysis, charts, components, heat, state
 from climada.ui.formatting import fmt_compact, fmt_percent, fmt_value
 
 DEFAULT_RP_CHOICES = [2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000]
@@ -113,6 +113,11 @@ def _controls() -> None:
 
 def _headline(risk: analysis.RiskResult) -> None:
     """Stat tiles summarising the assessment."""
+    metric = _heat_metric(risk)
+    if metric is not None:
+        _heat_headline(risk, metric)
+        return
+
     components.stat_row(
         [
             (
@@ -143,21 +148,101 @@ def _headline(risk: analysis.RiskResult) -> None:
     )
 
 
+def _impact_unit(risk: analysis.RiskResult) -> str:
+    """The unit the impact numbers are in, which is not the exposure unit.
+
+    A heat mortality run has exposures in people but an impact in deaths;
+    labelling the axis "people" would misreport it.
+
+    Parameters
+    ----------
+    risk : RiskResult
+
+    Returns
+    -------
+    str
+    """
+    metric = _heat_metric(risk)
+    return metric.unit if metric is not None else risk.unit
+
+
+def _heat_metric(risk: analysis.RiskResult):
+    """The heat metric in play, or None when this is not a heat analysis."""
+    key = state.get("heat_metric")
+    if key is None or risk.haz_type != heat.HAZ_TYPE:
+        return None
+    return heat.METRICS.get(key)
+
+
+def _heat_headline(risk: analysis.RiskResult, metric) -> None:
+    """Stat tiles that say deaths and people rather than loss and value."""
+    tiles = [
+        (
+            f"Annual {metric.unit}",
+            fmt_compact(risk.aai, ""),
+            f"Expected {metric.annual_noun}, averaged over the record",
+        )
+    ]
+    if metric.per_capita_basis and risk.total_value:
+        rate = risk.aai / risk.total_value * metric.per_capita_basis
+        tiles.append(
+            (
+                f"Per {metric.per_capita_basis:,.0f} people",
+                f"{rate:,.1f}",
+                f"Annual {metric.unit} per {metric.per_capita_basis:,.0f} of the "
+                "exposed population",
+            )
+        )
+    else:
+        tiles.append(
+            (
+                "Exposed population",
+                fmt_compact(risk.total_value, metric.exposure_unit),
+                "Total exposure the metric is computed over",
+            )
+        )
+    tiles.append(
+        (
+            "Worst day in the record",
+            fmt_compact(risk.max_event_impact, ""),
+            f"{metric.unit.capitalize()} on the single worst day",
+        )
+    )
+
+    summary = heat.hazard_temperature_summary(state.get("hazard"))
+    tiles.append(
+        (
+            "Peak temperature",
+            f"{summary['peak']:,.1f} {state.get('hazard').units}",
+            "Hottest value anywhere in the record",
+        )
+    )
+    components.stat_row(tiles)
+
+    st.caption(
+        f"{metric.label}: {metric.description} Computed over "
+        f"{risk.impact.at_event.size:,} daily fields spanning "
+        f"{summary['years']:,.1f} years, against "
+        f"{fmt_value(risk.total_value, metric.exposure_unit)}."
+    )
+
+
 def _curves(risk: analysis.RiskResult) -> None:
     """Exceedance curve and return-period bars, each with its table."""
     st.subheader("Loss exceedance")
     left, right = st.columns(2)
 
     with left:
+        unit = _impact_unit(risk)
         figure = charts.exceedance_curve(
             {"Current risk": (risk.freq_curve_return_per, risk.freq_curve_impact)},
-            unit=risk.unit,
+            unit=unit,
             dark=state.dark_mode(),
         )
         curve_frame = pd.DataFrame(
             {
                 "Return period (years)": risk.freq_curve_return_per,
-                f"Impact ({risk.unit})": risk.freq_curve_impact,
+                f"Impact ({unit})": risk.freq_curve_impact,
             }
         )
         components.chart_with_table(
@@ -172,7 +257,7 @@ def _curves(risk: analysis.RiskResult) -> None:
         figure = charts.return_period_bars(
             risk.return_periods,
             risk.rp_impact,
-            unit=risk.unit,
+            unit=_impact_unit(risk),
             dark=state.dark_mode(),
         )
         components.chart_with_table(
@@ -183,11 +268,18 @@ def _curves(risk: analysis.RiskResult) -> None:
             key="risk-rp",
         )
 
-    st.caption(
-        "The curve reads: a loss of this size or larger happens on average "
-        "once every N years. It is interpolated from the event set, so return "
-        "periods beyond the longest event interval are extrapolation."
-    )
+    if _heat_metric(risk) is not None:
+        st.caption(
+            "Each event is one day, so the curve reads: a day this bad or "
+            "worse comes round once every N years. Return periods longer than "
+            "the record are extrapolation."
+        )
+    else:
+        st.caption(
+            "The curve reads: a loss of this size or larger happens on average "
+            "once every N years. It is interpolated from the event set, so "
+            "return periods beyond the longest event interval are extrapolation."
+        )
 
 
 def _geography(risk: analysis.RiskResult) -> None:
@@ -200,19 +292,18 @@ def _geography(risk: analysis.RiskResult) -> None:
     if total_points > limit:
         st.caption(f"Showing the {limit:,} highest-impact of {total_points:,} points.")
 
+    unit = _impact_unit(risk)
     figure = charts.point_map(
         points,
         "eai",
-        unit=risk.unit,
+        unit=unit,
         dark=state.dark_mode(),
         title="Expected annual impact per location",
         basemap=bool(state.get("basemap")),
     )
     components.chart_with_table(
         figure,
-        points.head(200).rename(
-            columns={"eai": f"Expected annual impact ({risk.unit})"}
-        ),
+        points.head(200).rename(columns={"eai": f"Expected annual impact ({unit})"}),
         table_label="Show the worst-affected locations",
         download_name="impact_by_location.csv",
         key="risk-map",
@@ -224,7 +315,7 @@ def _geography(risk: analysis.RiskResult) -> None:
         figure = charts.series_bar_chart(
             [str(value) for value in regions["Region"]],
             regions["Expected annual impact"].values,
-            unit=risk.unit,
+            unit=_impact_unit(risk),
             dark=state.dark_mode(),
             title="Expected annual impact by region",
             x_title="Region id",
@@ -251,7 +342,7 @@ def _events(risk: analysis.RiskResult) -> None:
     figure = charts.series_bar_chart(
         list(events["Event"].astype(str)),
         events[impact_column].values,
-        unit=risk.unit,
+        unit=_impact_unit(risk),
         dark=state.dark_mode(),
         title="Most damaging events",
         x_title="Event",
@@ -271,7 +362,7 @@ def _events(risk: analysis.RiskResult) -> None:
         figure = charts.series_bar_chart(
             [str(year) for year in annual["Year"]],
             annual[value_column].values,
-            unit=risk.unit,
+            unit=_impact_unit(risk),
             dark=state.dark_mode(),
             title="Impact per year in the event set",
             x_title="Year",

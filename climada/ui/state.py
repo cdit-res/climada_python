@@ -41,6 +41,7 @@ DEFAULTS: Dict[str, Any] = {
     "impf_set": None,
     "impf_label": "",
     "impf_note": "",
+    "heat_metric": None,
     "measure_rows": [],
     "measure_source": "",
     # Appraisal settings

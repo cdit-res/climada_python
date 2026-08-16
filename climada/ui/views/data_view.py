@@ -32,7 +32,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from climada.ui import charts, components, datasets, state
+from climada.ui import charts, components, datasets, heat, state
 from climada.ui.formatting import fmt_compact
 
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "climada_ui_uploads"
@@ -72,6 +72,63 @@ def render() -> None:
 def _quick_start() -> None:
     """Load a complete bundled scenario in one click."""
     st.subheader("Start from a demo")
+
+    generated_tab, bundled_tab = st.tabs(["Heat (generated)", "Bundled CLIMADA demos"])
+    with generated_tab:
+        _generated_start()
+    with bundled_tab:
+        _bundled_start()
+
+
+def _generated_start() -> None:
+    """Build a heat analysis from scratch, since none ships with CLIMADA."""
+    keys = list(datasets.GENERATED_SCENARIOS)
+    choice = st.selectbox(
+        "Generated scenario",
+        keys,
+        format_func=lambda key: datasets.GENERATED_SCENARIOS[key]["label"],
+        key="w_gen_choice",
+    )
+    st.caption(datasets.GENERATED_SCENARIOS[choice]["description"])
+
+    metric = st.selectbox(
+        "What to count",
+        list(heat.METRICS),
+        format_func=lambda key: heat.METRICS[key].label,
+        help="Heat risk can be counted as deaths, exposure, degree-days or "
+        "lost work. They use the same machinery and read very differently.",
+        key="w_gen_metric",
+    )
+    st.caption(heat.METRICS[metric].description)
+
+    if st.button("Generate scenario", type="primary", key="w_gen_load"):
+        try:
+            with st.spinner("Generating the temperature field..."):
+                bundle = heat.demo_bundle(metric=metric)
+        except Exception as err:
+            components.error_box(err, "generate the heat scenario")
+            return
+
+        label = datasets.GENERATED_SCENARIOS[choice]["label"]
+        state.put("hazard", bundle["hazard"], invalidates=True)
+        state.put("hazard_label", label)
+        state.put("exposures", bundle["exposures"])
+        state.put("exposures_label", f"{label} (synthetic population)")
+        state.put("impf_set", bundle["impf_set"])
+        state.put("impf_label", heat.METRICS[metric].label)
+        state.put("impf_note", bundle["note"])
+        state.put("heat_metric", metric)
+        state.put("present_year", int(bundle["exposures"].ref_year))
+        state.put("future_year", 2050)
+        state.set_measure_rows([])
+        st.success(
+            f"Generated '{label}'. Open **Risk** to see the "
+            f"{heat.METRICS[metric].annual_noun}."
+        )
+
+
+def _bundled_start() -> None:
+    """Load a complete scenario from the data bundled with CLIMADA."""
     available = {
         key: scenario
         for key, scenario in datasets.DEMO_SCENARIOS.items()
@@ -129,7 +186,12 @@ def _hazard_section() -> None:
     if hazard is not None:
         _hazard_summary(hazard)
 
-    file_tab, api_tab = st.tabs(["From a file", "From the CLIMADA Data API"])
+    file_tab, grid_tab, api_tab = st.tabs(
+        ["From a file", "Gridded temperature (heat)", "From the CLIMADA Data API"]
+    )
+
+    with grid_tab:
+        _gridded_hazard()
 
     with file_tab:
         st.markdown(
@@ -161,6 +223,87 @@ def _hazard_section() -> None:
 
     with api_tab:
         _api_hazard()
+
+
+def _gridded_hazard() -> None:
+    """Read daily temperature fields into a heat hazard."""
+    st.markdown(
+        "Neither CLIMADA's Data API nor Petals serves a heat hazard, so heat "
+        "risk starts from your own gridded temperature: daily maximum "
+        "temperature from a reanalysis such as ERA5, or from a climate model. "
+        "Every time step becomes one event."
+    )
+    uploaded = st.file_uploader(
+        "NetCDF or GRIB file", type=["nc", "nc4", "grib"], key="w_grid_upload"
+    )
+    if uploaded is None:
+        st.caption(
+            "No file? The **Heat (generated)** demo above builds a synthetic "
+            "temperature field so you can walk the workflow first."
+        )
+        return
+
+    left, right = st.columns(2)
+    variable = left.text_input(
+        "Intensity variable",
+        value="tasmax",
+        help="Name of the temperature variable in the file, e.g. 'tasmax' "
+        "(CMIP6) or 't2m' (ERA5).",
+        key="w_grid_var",
+    )
+    unit = right.text_input("Intensity unit", value="degC", key="w_grid_unit")
+    to_celsius = st.checkbox(
+        "Convert from kelvin",
+        value=False,
+        help="ERA5 and most model output are in kelvin. Subtracts 273.15.",
+        key="w_grid_kelvin",
+    )
+
+    with st.expander("Coordinate names"):
+        cols = st.columns(3)
+        time_var = cols[0].text_input("Time", value="time", key="w_grid_time")
+        lat_var = cols[1].text_input("Latitude", value="latitude", key="w_grid_lat")
+        lon_var = cols[2].text_input("Longitude", value="longitude", key="w_grid_lon")
+
+    years = st.number_input(
+        "Record length in years (0 = read it from the timestamps)",
+        min_value=0.0,
+        value=0.0,
+        step=1.0,
+        help="Sets the event frequency. A daily record spanning N years gives "
+        "every day a frequency of 1/N per year, which is what makes the "
+        "average annual impact come out per year.",
+        key="w_grid_years",
+    )
+
+    if not st.button("Load gridded hazard", type="primary", key="w_grid_load"):
+        return
+
+    try:
+        path = components.save_upload(uploaded, UPLOAD_DIR)
+        with st.spinner("Reading the grid -- large files take a while..."):
+            hazard = datasets.load_gridded_hazard(
+                path,
+                intensity=variable,
+                intensity_unit=unit,
+                time_var=time_var,
+                lat_var=lat_var,
+                lon_var=lon_var,
+                to_celsius=to_celsius,
+                years=float(years) or None,
+            )
+    except Exception as err:
+        components.error_box(err, "read the gridded hazard")
+        return
+
+    state.put("hazard", hazard, invalidates=True)
+    state.put("hazard_label", f"{uploaded.name} ({variable})")
+    summary = heat.hazard_temperature_summary(hazard)
+    st.success(
+        f"Loaded {hazard.size:,} time steps over {summary['centroids']:,.0f} "
+        f"grid points, spanning {summary['years']:,.1f} years."
+    )
+    st.rerun()
 
 
 def _hazard_summary(hazard) -> None:
@@ -427,15 +570,33 @@ def _api_litpop() -> None:
         return
 
     country = st.selectbox("Country", countries, key="w_exp_api_country")
+    layer = st.radio(
+        "Layer",
+        ["Produced capital (USD)", "Population (people)"],
+        help="Heat metrics count people, so heat analyses need the population "
+        "layer. Damage-in-currency analyses need produced capital.",
+        key="w_exp_api_layer",
+        horizontal=True,
+    )
+    people = layer.startswith("Population")
+
     if st.button("Download LitPop", type="primary", key="w_exp_api_load"):
         try:
             with st.spinner(f"Downloading LitPop for {country}..."):
-                exposures = client.get_litpop(country)
+                exposures = (
+                    datasets.api_population(client, country)
+                    if people
+                    else client.get_litpop(country)
+                )
         except Exception as err:
             components.error_box(err, "download LitPop")
             return
         state.put("exposures", exposures, invalidates=True)
-        state.put("exposures_label", f"LitPop {country} (Data API)")
+        state.put(
+            "exposures_label",
+            f"LitPop {country} ({'population' if people else 'produced capital'},"
+            " Data API)",
+        )
         st.success(f"Loaded {len(exposures.gdf):,} exposure points.")
         st.rerun()
 
@@ -507,14 +668,18 @@ def _impf_section() -> None:
     if impf_set is not None:
         _impf_summary(impf_set, haz_type)
 
-    default_tab, emanuel_tab, step_tab, file_tab = st.tabs(
+    heat_tab, default_tab, emanuel_tab, step_tab, file_tab = st.tabs(
         [
+            "Heat",
             "Calibrated default",
             "Tropical cyclone (Emanuel)",
             "Step function",
             "From a file",
         ]
     )
+
+    with heat_tab:
+        _heat_impf(haz_type)
 
     with default_tab:
         if not haz_type:
@@ -638,6 +803,107 @@ def _impf_section() -> None:
 
     if impf_set is not None and haz_type:
         _impf_assignment(impf_set, haz_type)
+
+
+def _heat_impf(haz_type: str) -> None:
+    """Build a temperature-response curve and record what it counts."""
+    st.markdown(
+        "CLIMADA ships no calibrated heat curve, so pick what you want to "
+        "count and set the parameters from local evidence."
+    )
+    if haz_type and haz_type != heat.HAZ_TYPE:
+        st.warning(
+            f"The loaded hazard is '{haz_type}', not '{heat.HAZ_TYPE}'. A heat "
+            "curve built here would not be found by the impact calculation."
+        )
+
+    metric = st.selectbox(
+        "What to count",
+        list(heat.METRICS),
+        format_func=lambda key: heat.METRICS[key].label,
+        key="w_heat_metric",
+    )
+    spec = heat.METRICS[metric]
+    st.caption(f"{spec.description} Exposures must be in **{spec.exposure_unit}**.")
+
+    kwargs = {}
+    if metric == "mortality":
+        cols = st.columns(3)
+        kwargs["mmt"] = cols[0].number_input(
+            "Minimum-mortality temperature (degC)",
+            min_value=0.0,
+            max_value=45.0,
+            value=22.0,
+            step=0.5,
+            help="Below this, no excess deaths are attributed. Location- "
+            "specific: roughly 18-20 degC in northern Europe, 26-29 in the "
+            "tropics.",
+            key="w_heat_mmt",
+        )
+        kwargs["rr_per_degree"] = cols[1].number_input(
+            "Extra mortality per degree above it",
+            min_value=0.0,
+            max_value=0.30,
+            value=0.03,
+            step=0.005,
+            format="%.3f",
+            help="Meta-analyses put all-age all-cause risk at 1-5% per degC, "
+            "higher for the over-75s.",
+            key="w_heat_rr",
+        )
+        kwargs["baseline_daily_mortality"] = cols[2].number_input(
+            "Baseline deaths per person per day",
+            min_value=0.0,
+            max_value=1e-3,
+            value=2.4e-5,
+            step=1e-6,
+            format="%.6f",
+            help="2.4e-5 is about 8.8 deaths per 1,000 people per year. Raise "
+            "it for an older population.",
+            key="w_heat_baseline",
+        )
+    elif metric == "days_above":
+        kwargs["threshold"] = st.number_input(
+            "Threshold (degC)", value=35.0, step=0.5, key="w_heat_days_thresh"
+        )
+    elif metric == "degree_days":
+        kwargs["threshold"] = st.number_input(
+            "Base temperature (degC)", value=30.0, step=0.5, key="w_heat_dd_thresh"
+        )
+    elif metric == "labour":
+        cols = st.columns(2)
+        kwargs["work_start"] = cols[0].number_input(
+            "Productivity starts falling (degC)",
+            value=26.0,
+            step=0.5,
+            key="w_heat_wstart",
+        )
+        kwargs["work_stop"] = cols[1].number_input(
+            "Work stops entirely (degC)",
+            value=38.0,
+            step=0.5,
+            key="w_heat_wstop",
+        )
+
+    if not st.button("Use this curve", type="primary", key="w_heat_build"):
+        return
+
+    try:
+        impf_set = heat.impf_set_for_metric(metric, **kwargs)
+    except (ValueError, KeyError) as err:
+        st.error(str(err))
+        return
+
+    state.put("impf_set", impf_set, invalidates=True)
+    state.put("impf_label", spec.label)
+    state.put(
+        "impf_note",
+        f"Counting {spec.unit}. {spec.description} This is a screening "
+        "relationship, not an epidemiological study -- calibrate it before "
+        "reporting the numbers.",
+    )
+    state.put("heat_metric", metric)
+    st.rerun()
 
 
 def _impf_summary(impf_set, haz_type: str) -> None:
